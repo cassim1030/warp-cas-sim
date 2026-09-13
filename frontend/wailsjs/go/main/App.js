@@ -14,10 +14,18 @@ export function GenerateConfigs(arg1, arg2, arg3) {
   return window['go']['main']['App']['GenerateConfigs'](arg1, arg2, arg3);
 }
 
+export function IsSystemProxyOn() {
+  return window['go']['main']['App']['IsSystemProxyOn']();
+}
+
 export function RegisterCloudflareAccount(arg1, arg2) {
   return window['go']['main']['App']['RegisterCloudflareAccount'](arg1, arg2);
 }
 
 export function RunWarpScoutFullEngine(arg1) {
   return window['go']['main']['App']['RunWarpScoutFullEngine'](arg1);
+}
+
+export function SetSystemProxy(arg1) {
+  return window['go']['main']['App']['SetSystemProxy'](arg1);
 }

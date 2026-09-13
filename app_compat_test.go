@@ -69,5 +69,29 @@ func TestLegacyCompat(t *testing.T) {
 		t.Fatal("节点选择 default must be 测速分组")
 	}
 	os.WriteFile("C:/dsh-test/bpb-singbox.json", []byte(sb), 0644)
-	t.Logf("singbox two-group config saved")
+
+	// 修复回归 (2026-09-13): AI 检测失败 ≠ 丢账号 — 内层账号全保留为节点
+	sbAI := strings.Count(sb, "AI-WARP专线")
+	if sbAI < 1 {
+		t.Fatal("AI endpoints missing from singbox config")
+	}
+	t.Logf("AI line endpoints in config: %d", sbAI)
+	// YouTube 视频流域名必须进 DNS/路由 (googlevideo.com 是视频流主体域名)
+	if !strings.Contains(sb, "googlevideo.com") {
+		t.Fatal("googlevideo.com must be in DNS/route rules (YouTube stream domain)")
+	}
+
+	// Clash YAML 回归: DoH nameserver (根治明文 53 投毒), googlevideo 显式规则
+	cy := res["clashYaml"]
+	if !strings.Contains(cy, "https://1.1.1.1/dns-query") {
+		t.Fatal("clash DNS must use DoH (plaintext 53 poisoned in CN)")
+	}
+	if !strings.Contains(cy, "DOMAIN-SUFFIX,googlevideo.com,普通节点") {
+		t.Fatal("clash rules must route googlevideo.com explicitly")
+	}
+	if strings.Contains(cy, "- \"*\"") {
+		t.Fatal("clash fake-ip-filter must not contain bare * (kills fake-ip)")
+	}
+	os.WriteFile("C:/dsh-test/bpb-clash.yaml", []byte(cy), 0644)
+	t.Logf("singbox two-group config + clash yaml saved")
 }

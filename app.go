@@ -32,6 +32,7 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed sing-box.exe
@@ -199,6 +200,17 @@ func (a *App) startLocalServer() {
 		defer a.subMutex.RUnlock()
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		ua := r.Header.Get("User-Agent")
+		// 手机官方客户端 (SFA/SFI/移动版 sing-box GUI) 拉订阅时自动下发 tun 版配置:
+		// 手机上没有 "系统代理" 可设, 只有 tun 才能接管全局流量 — 按特征分发免手动.
+		isMobileUA := strings.Contains(ua, "SFA") || strings.Contains(ua, "SFI") ||
+			strings.Contains(strings.ToLower(ua), "sing-box") ||
+			strings.Contains(ua, "Android") || strings.Contains(ua, "iPhone") ||
+			strings.Contains(ua, "iPad") || strings.Contains(strings.ToLower(ua), "okhttp")
+		if isMobileUA && a.mobileContent != "" {
+			w.Write([]byte(a.mobileContent))
+			return
+		}
 		if a.subContent == "" {
 			w.Write([]byte(`{"status":"waiting","message":"请先生成有效配置"}`))
 			return
@@ -778,6 +790,44 @@ func lanIP() string {
 	return "127.0.0.1"
 }
 
+// SetSystemProxy: 一键设置/取消 Windows 系统代理 (HKCU 注册表, 无需管理员权限)。
+// 写 CurrentVersion\\Microsoft...Internet Settings 的 ProxyEnable/ProxyServer —
+// SFW 官方 GUI「系统 HTTP 代理」开关背后就是这两个键。
+func (a *App) SetSystemProxy(on bool) string {
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
+	if err != nil {
+		return "打开注册表失败: " + err.Error()
+	}
+	defer key.Close()
+
+	var v uint32
+	if on {
+		v = 1
+	}
+	if err := key.SetDWordValue("ProxyEnable", v); err != nil {
+		return "写入 ProxyEnable 失败: " + err.Error()
+	}
+	if on {
+		if err := key.SetStringValue("ProxyServer", "127.0.0.1:2080"); err != nil {
+			return "写入 ProxyServer 失败: " + err.Error()
+		}
+	}
+	return "OK"
+}
+
+// IsSystemProxyOn: 读取当前系统代理状态 (前端按钮回显)。
+func (a *App) IsSystemProxyOn() bool {
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+	v, _, err := key.GetIntegerValue("ProxyEnable")
+	if err != nil {
+		return false
+	}
+	return v == 1
+}
 func waitForPort(addr string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -793,19 +843,104 @@ func waitForPort(addr string, timeout time.Duration) bool {
 
 // checkAIUnlockThroughInner 用内层账号起一条临时隧?? 实测 chatgpt.com ?????.
 // 判定标准??usque 出口检测器一?? HTTP 状??< 400 且页????"unsupported_country" ??// 封??标??. Gemini 不作??(Google 放??几乎所??WARP ??, 必须??OpenAI.
-func (a *App) checkAIUnlockThroughInner(innerAcc *WarpAccount, ep EndpointResult, socksPort int) bool {
-	cmd, err := a.startSingBoxProxy(innerAcc, ep, "awg", socksPort)
-	if err != nil {
+func (a *App) checkAIUnlockThroughInner(innerAcc *WarpAccount, outerAcc *WarpAccount, ep EndpointResult, socksPort int) bool {
+	// 真实链路检测 (修复 2026-09-13): 原实现让内层账号直连外层优选端点 —
+	// 端点分钟级漂移死亡时 WG 握手永远完不成, 6-18 秒后返回 false,
+	// 被上层误报为 "ChatGPT 封禁" (真封禁是秒回 unsupported_country 页面)。
+	// 现在与最终导出配置同构: 外层 WG (当前验证过的活端点) + 内层 WG detour 外层,
+	// 出口与用户实际使用的 AI 专线完全一致。
+	if a.tempSingboxPath == "" {
+		a.tempSingboxPath = a.prepareSingbox()
+	}
+	if a.tempSingboxPath == "" {
+		return false
+	}
+
+	cleanIP := strings.Trim(ep.IP, "[]")
+	oV4 := strings.TrimSuffix(outerAcc.AddressV4, "/32")
+	oV6 := strings.TrimSuffix(outerAcc.AddressV6, "/128")
+	iV4 := strings.TrimSuffix(innerAcc.AddressV4, "/32")
+	iV6 := strings.TrimSuffix(innerAcc.AddressV6, "/128")
+
+	cfg := map[string]interface{}{
+		"log": map[string]interface{}{"level": "fatal", "timestamp": false},
+		"inbounds": []map[string]interface{}{
+			{"type": "socks", "tag": "check-in", "listen": "127.0.0.1", "listen_port": socksPort},
+		},
+		"endpoints": []map[string]interface{}{
+			{
+				"type":        "wireguard",
+				"tag":         "check-outer",
+				"address":     []string{oV4 + "/32", oV6 + "/128"},
+				"private_key": outerAcc.PrivateKey,
+				"mtu":         1420,
+				"peers": []map[string]interface{}{
+					{
+						"address":                       cleanIP,
+						"port":                          ep.Port,
+						"public_key":                    outerAcc.PeerPublicKey,
+						"allowed_ips":                   []string{"0.0.0.0/0", "::/0"},
+						"reserved":                     []int{int(outerAcc.Reserved[0]), int(outerAcc.Reserved[1]), int(outerAcc.Reserved[2])},
+						"persistent_keepalive_interval": 25,
+					},
+				},
+			},
+			{
+				"type":        "wireguard",
+				"tag":         "check-inner",
+				"address":     []string{iV4 + "/32", iV6 + "/128"},
+				"private_key": innerAcc.PrivateKey,
+				"mtu":         1280,
+				"detour":      "check-outer",
+				"peers": []map[string]interface{}{
+					{
+						"address":                       cleanIP,
+						"port":                          ep.Port,
+						"public_key":                    innerAcc.PeerPublicKey,
+						"allowed_ips":                   []string{"0.0.0.0/0", "::/0"},
+						"reserved":                     []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
+						"persistent_keepalive_interval": 25,
+					},
+				},
+			},
+		},
+		"outbounds": []map[string]interface{}{{"type": "direct", "tag": "direct"}},
+		"route": map[string]interface{}{
+			"final":                   "check-inner",
+			"default_domain_resolver": map[string]interface{}{"server": "check-dns"},
+		},
+		"dns": map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{"type": "udp", "tag": "check-dns", "server": "1.1.1.1", "detour": "check-inner"},
+			},
+		},
+	}
+
+	cfgBytes, _ := json.MarshalIndent(cfg, "", "  ")
+	cfgPath := filepath.Join(os.TempDir(), fmt.Sprintf("xhs-temp_aicheck_%d.json", socksPort))
+	if err := os.WriteFile(cfgPath, cfgBytes, 0644); err != nil {
+		return false
+	}
+	defer os.Remove(cfgPath)
+
+	checkCmd := hiddenCmd(a.tempSingboxPath, "check", "-c", cfgPath)
+	if checkOut, err := checkCmd.CombinedOutput(); err != nil {
+		_ = checkOut
+		return false
+	}
+
+	cmd := hiddenCmd(a.tempSingboxPath, "run", "-c", cfgPath)
+	if err := cmd.Start(); err != nil {
 		return false
 	}
 	defer func() {
-		if cmd != nil && cmd.Process != nil {
+		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
 		_ = cmd.Wait()
 	}()
 
-	if !waitForPort(fmt.Sprintf("127.0.0.1:%d", socksPort), 6*time.Second) {
+	if !waitForPort(fmt.Sprintf("127.0.0.1:%d", socksPort), 10*time.Second) {
 		return false
 	}
 
@@ -832,6 +967,139 @@ func (a *App) checkAIUnlockThroughInner(innerAcc *WarpAccount, ep EndpointResult
 // probeWarpHandshake: 数据面真值验????用内??sing-box 对单?????点建??WireGuard 隧道
 // 并通过它????cp.cloudflare.com/generate_204. 能拿到任??HTTP 响应即证??
 // UDP ??? + Noise_KK 握手完成 + 数据面可?? 从根上杜??????但永远握不上??的假活????
+// measureChainSpeed: warp-in-warp 整链真实测速 — 与 checkAIUnlockThroughInner 同构
+// (内层账号 detour 外层账号的临时链式隧道), 但出口跑 CF 测速流采样 3 秒下载速率。
+// 单层端点测速 (measureDownloadSpeed) 只代表外层直连性能; 套娃链路有双重 WG 封装
+// 开销, 真实吞吐以链路实测为准 (用户实测反馈: 最快外层 ≠ 最快套娃)。
+func (a *App) measureChainSpeed(innerAcc *WarpAccount, outerAcc *WarpAccount, ep EndpointResult, socksPort int) (float64, bool) {
+	if a.tempSingboxPath == "" {
+		a.tempSingboxPath = a.prepareSingbox()
+	}
+	if a.tempSingboxPath == "" {
+		return 0, false
+	}
+
+	cleanIP := strings.Trim(ep.IP, "[]")
+	oV4 := strings.TrimSuffix(outerAcc.AddressV4, "/32")
+	oV6 := strings.TrimSuffix(outerAcc.AddressV6, "/128")
+	iV4 := strings.TrimSuffix(innerAcc.AddressV4, "/32")
+	iV6 := strings.TrimSuffix(innerAcc.AddressV6, "/128")
+
+	cfg := map[string]interface{}{
+		"log": map[string]interface{}{"level": "fatal", "timestamp": false},
+		"inbounds": []map[string]interface{}{
+			{"type": "socks", "tag": "chain-in", "listen": "127.0.0.1", "listen_port": socksPort},
+		},
+		"endpoints": []map[string]interface{}{
+			{
+				"type":        "wireguard",
+				"tag":         "chain-outer",
+				"address":     []string{oV4 + "/32", oV6 + "/128"},
+				"private_key": outerAcc.PrivateKey,
+				"mtu":         1420,
+				"peers": []map[string]interface{}{
+					{
+						"address":                       cleanIP,
+						"port":                          ep.Port,
+						"public_key":                    outerAcc.PeerPublicKey,
+						"allowed_ips":                   []string{"0.0.0.0/0", "::/0"},
+						"reserved":                     []int{int(outerAcc.Reserved[0]), int(outerAcc.Reserved[1]), int(outerAcc.Reserved[2])},
+						"persistent_keepalive_interval": 25,
+					},
+				},
+			},
+			{
+				"type":        "wireguard",
+				"tag":         "chain-inner",
+				"address":     []string{iV4 + "/32", iV6 + "/128"},
+				"private_key": innerAcc.PrivateKey,
+				"mtu":         1280,
+				"detour":      "chain-outer",
+				"peers": []map[string]interface{}{
+					{
+						"address":                       cleanIP,
+						"port":                          ep.Port,
+						"public_key":                    innerAcc.PeerPublicKey,
+						"allowed_ips":                   []string{"0.0.0.0/0", "::/0"},
+						"reserved":                     []int{int(innerAcc.Reserved[0]), int(innerAcc.Reserved[1]), int(innerAcc.Reserved[2])},
+						"persistent_keepalive_interval": 25,
+					},
+				},
+			},
+		},
+		"outbounds": []map[string]interface{}{{"type": "direct", "tag": "direct"}},
+		"route": map[string]interface{}{
+			"final":                   "chain-inner",
+			"default_domain_resolver": map[string]interface{}{"server": "chain-dns"},
+		},
+		"dns": map[string]interface{}{
+			"servers": []map[string]interface{}{
+				{"type": "udp", "tag": "chain-dns", "server": "1.1.1.1", "detour": "chain-inner"},
+			},
+		},
+	}
+
+	cfgBytes, _ := json.MarshalIndent(cfg, "", "  ")
+	cfgPath := filepath.Join(os.TempDir(), fmt.Sprintf("xhs-temp_chainspeed_%d.json", socksPort))
+	if err := os.WriteFile(cfgPath, cfgBytes, 0644); err != nil {
+		return 0, false
+	}
+	defer os.Remove(cfgPath)
+
+	checkCmd := hiddenCmd(a.tempSingboxPath, "check", "-c", cfgPath)
+	if _, err := checkCmd.CombinedOutput(); err != nil {
+		return 0, false
+	}
+
+	cmd := hiddenCmd(a.tempSingboxPath, "run", "-c", cfgPath)
+	if err := cmd.Start(); err != nil {
+		return 0, false
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	if !waitForPort(fmt.Sprintf("127.0.0.1:%d", socksPort), 10*time.Second) {
+		return 0, false
+	}
+
+	proxyURL, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", socksPort))
+	client := &http.Client{
+		Timeout:   12 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+	}
+	resp, err := client.Get("https://speed.cloudflare.com/__down?bytes=50000000")
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+
+	buf := make([]byte, 32*1024)
+	var total int64
+	start := time.Now()
+	for {
+		n, rerr := resp.Body.Read(buf)
+		total += int64(n)
+		if rerr != nil {
+			break
+		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second && total > 200*1024 {
+			break
+		}
+	}
+	elapsed := time.Since(start).Seconds()
+	if elapsed < 0.5 || total < 200*1024 {
+		return 0, false
+	}
+	mbps := float64(total) * 8 / (elapsed * 1_000_000)
+	if mbps > 1000 {
+		mbps = 1000
+	}
+	return mbps, true
+}
 func (a *App) probeWarpHandshakeOnPort(acc *WarpAccount, ep EndpointResult, socksPort int, timeout time.Duration) bool {
 	if a.tempSingboxPath == "" {
 		a.tempSingboxPath = a.prepareSingbox()
@@ -1447,7 +1715,8 @@ func (a *App) GenerateConfigs(protocol string, count int, aiCount int) (map[stri
 		if cand == nil {
 			break
 		}
-		if a.checkAIUnlockThroughInner(cand, endpoints[0], 20818) {
+		checkPort := 20818 + attempt
+		if a.checkAIUnlockThroughInner(cand, outerAcc, endpoints[0], checkPort) {
 			aiUnlocked = true
 			innerAccs = append(innerAccs, cand)
 			if len(innerAccs) == 1 {
@@ -1457,15 +1726,14 @@ func (a *App) GenerateConfigs(protocol string, count int, aiCount int) (map[stri
 			}
 			continue
 		}
-		if len(innerAccs) > 0 {
-			// 已有????, 不再为凑数冒?? 剩余名??留待 fallback 容灾即可
-			break
+		// 检测失败 ≠ 账号不可用: 出口可能是解锁状态 (检测受网络波动/握手时序影响),
+		// 失败账号也收进候选池, 导出后用户可在 AI 分组手动切换实测 — 比丢弃更稳.
+		innerAccs = append(innerAccs, cand)
+		if len(innerAccs) == 1 {
+			a.sendLog("⚠️ 第 1 个内层出口 AI 解锁检测未通过 (隧道波动或出口被标记), 已保留为候选节点, 生成后可在 AI 分组实测切换")
+		} else {
+			a.sendLog(fmt.Sprintf("⚠️ 第 %d 个内层出口 AI 解锁检测未通过, 已保留为候选节点", len(innerAccs)))
 		}
-		// 全部???? 保留最后一??????(旧版行为 ??配置仍生?? AI ????实际为准)
-		if attempt == 4 {
-			innerAcc = cand
-		}
-		a.sendLog(fmt.Sprintf("⚠️ 第 %d 个内层出口 IP 被 ChatGPT 封禁, 换新出口重试...", attempt))
 	}
 	if len(innerAccs) > 0 {
 		innerAcc = innerAccs[0]
@@ -1561,11 +1829,52 @@ func (a *App) GenerateConfigs(protocol string, count int, aiCount int) (map[stri
 	if len(innerAccs) > 1 {
 		aiWGs = innerAccs
 	}
+	// warp-in-warp 整链测速 (2026-09-13): 单层端点测速只代表外层账号直连的性能,
+	// 套娃链路 = 外层 WG + 内层 WG 双重封装, 实际吞吐必须以链路实测为准。
+	// 每条 AI 专线起同构临时隧道 (内层 detour 外层), 经 CF 测速流采样 3 秒,
+	// 节点名直接标注链路实测速度; 失败的标注 "链路测速失败" 但保留节点 (不丢弃)。
+	chainSpeeds := make([]float64, len(aiWGs))
+	{
+		type csRes struct {
+			idx    int
+			mbps   float64
+			ok     bool
+		}
+		resCh := make([]csRes, len(aiWGs))
+		var csWg sync.WaitGroup
+		for i := range aiWGs {
+			csWg.Add(1)
+			go func(i int) {
+				defer csWg.Done()
+				ep := endpoints[i%len(endpoints)]
+				if mbps, ok := a.measureChainSpeed(aiWGs[i], outerAcc, ep, 20840+i); ok {
+					resCh[i] = csRes{idx: i, mbps: mbps, ok: true}
+				} else {
+					resCh[i] = csRes{idx: i}
+				}
+			}(i)
+		}
+		csWg.Wait()
+		for _, r := range resCh {
+			chainSpeeds[r.idx] = r.mbps
+			if r.ok {
+				a.sendLog(fmt.Sprintf("🚀 AI-WARP专线-%02d warp-in-warp 整链实测: %.1f Mbps (外层 %s:%d)", r.idx+1, r.mbps, strings.Trim(endpoints[r.idx%len(endpoints)].IP, "[]"), endpoints[r.idx%len(endpoints)].Port))
+			} else {
+				a.sendLog(fmt.Sprintf("⚠️ AI-WARP专线-%02d 整链测速失败 (隧道波动), 节点保留可用性以实际为准", r.idx+1))
+			}
+		}
+	}
 	var innerTags []string
 	for i, acc := range aiWGs {
 		tag := fmt.Sprintf("🤖 AI-WARP专线-%02d", i+1)
+		if chainSpeeds[i] > 0 {
+			tag = fmt.Sprintf("🤖 AI-WARP专线-%02d (%.1fMbps链路)", i+1, chainSpeeds[i])
+		}
 		if len(aiWGs) == 1 {
 			tag = "🤖 AI-WARP专线"
+			if chainSpeeds[i] > 0 {
+				tag = fmt.Sprintf("🤖 AI-WARP专线 (%.1fMbps链路)", chainSpeeds[i])
+			}
 		}
 		innerTags = append(innerTags, tag)
 		singboxEndpoints = append(singboxEndpoints, map[string]interface{}{
@@ -1631,7 +1940,8 @@ func (a *App) GenerateConfigs(protocol string, count int, aiCount int) (map[stri
 					"anthropic.com", "claude.ai", "claudeusercontent.com",
 					"grok.com", "x.ai", "perplexity.ai", "pplx.ai",
 					"gemini.google.com", "bard.google.com", "aistudio.google.com", "generativelanguage.googleapis.com",
-					"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "youtube.com", "ytimg.com",
+					"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "youtube.com", "ytimg.com", "youtubei.googleapis.com",
+					"googlevideo.com", "ggpht.com", "gvt1.com", "gvt2.com", "video.google.com", "youtube-nocookie.com", "youtu.be",
 					"github.com", "githubusercontent.com", "telegram.org", "t.me", "twitter.com", "x.com", "twimg.com",
 				}, "server": "dns-remote"},
 				{"domain_suffix": []string{"cn", "qq.com", "taobao.com", "baidu.com", "bilibili.com", "weibo.com", "zhihu.com", "163.com"}, "server": "dns-direct"},
@@ -1659,7 +1969,8 @@ func (a *App) GenerateConfigs(protocol string, count int, aiCount int) (map[stri
 				}, "outbound": "节点选择"},
 				// 流媒体/常用国际站走外层
 				{"domain_suffix": []string{
-					"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "ggpht.com", "youtube.com", "ytimg.com", "youtu.be", "gvt2.com",
+					"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "ggpht.com", "youtube.com", "ytimg.com", "youtu.be", "gvt2.com", "gvt1.com",
+					"googlevideo.com", "youtubei.googleapis.com", "video.google.com", "youtube-nocookie.com", "withgoogle.com",
 					"github.com", "githubusercontent.com", "githubassets.com", "github.io",
 					"telegram.org", "t.me", "telegram.me", "tdesktop.com", "telesco.pe",
 					"twitter.com", "x.com", "twimg.com", "t.co", "x.twimg.com",
@@ -1700,7 +2011,9 @@ func (a *App) GenerateConfigs(protocol string, count int, aiCount int) (map[stri
 			"type":         "tun",
 			"tag":          "tun-in",
 			"address":      []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
-			"mtu":          9000,
+			// MTU 1280 (IPv6 安全下限): warp-in-warp 双层封装下更大的 MTU 会
+			// 触发分片, 实测表现为视频流卡顿 — 与内层 WG 隧道一致.
+			"mtu":          1280,
 			"auto_route":   true,
 			"strict_route": false,
 			"stack":        "mixed",
@@ -1878,8 +2191,14 @@ func (a *App) GenerateConfigs(protocol string, count int, aiCount int) (map[stri
 	for i, acc := range aiWGsC {
 		ep := endpoints[i%len(endpoints)]
 		aiName := fmt.Sprintf("🤖 AI-WARP专线-%02d", i+1)
+		if chainSpeeds != nil && i < len(chainSpeeds) && chainSpeeds[i] > 0 {
+			aiName = fmt.Sprintf("🤖 AI-WARP专线-%02d (%.1fMbps链路)", i+1, chainSpeeds[i])
+		}
 		if len(aiWGsC) == 1 {
 			aiName = "🤖 AI-WARP专线"
+			if chainSpeeds != nil && len(chainSpeeds) > 0 && chainSpeeds[0] > 0 {
+				aiName = fmt.Sprintf("🤖 AI-WARP专线 (%.1fMbps链路)", chainSpeeds[0])
+			}
 		}
 		iv4 := strings.TrimSuffix(acc.AddressV4, "/32")
 		iv6 := strings.TrimSuffix(acc.AddressV6, "/128")
@@ -1926,18 +2245,18 @@ dns:
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
-    - "*"
     - "+.lan"
     - "+.local"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
+  # 明文 UDP 53 的 1.1.1.1/8.8.8.8 在国内网络被投毒/拦截 — yt3.ggpht.com
+  # 解析失败即此因。改用加密 DoH, 流量经 WARP 出口, 与代理分流一致。
   nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
-  fallback:
-    - 1.1.1.1
-    - 8.8.8.8
+    - "https://1.1.1.1/dns-query"
+    - "https://8.8.8.8/dns-query"
 
 proxies:
 %s
@@ -1946,7 +2265,8 @@ proxy-groups:
     type: url-test
     url: http://cp.cloudflare.com/generate_204
     interval: 300
-    tolerance: 50
+    tolerance: 150
+    lazy: false
     proxies:
 %s
 
@@ -1986,6 +2306,8 @@ rules:
   - DOMAIN-SUFFIX,gemini.google.com,🤖 AI 专线
   - DOMAIN-SUFFIX,generativelanguage.googleapis.com,🤖 AI 专线
   - DOMAIN-SUFFIX,aistudio.google.com,🤖 AI 专线
+  - DOMAIN-SUFFIX,googlevideo.com,普通节点
+  - DOMAIN-KEYWORD,googlevideo,普通节点
   - GEOSITE,google,普通节点
   - GEOSITE,youtube,普通节点
   - GEOSITE,telegram,普通节点

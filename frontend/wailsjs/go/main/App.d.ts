@@ -8,6 +8,10 @@ export function ExportWireGuardZip(arg1:string):Promise<string>;
 
 export function GenerateConfigs(arg1:string,arg2:number,arg3:number):Promise<{[key: string]: string}>;
 
+export function IsSystemProxyOn():Promise<boolean>;
+
 export function RegisterCloudflareAccount(arg1:string,arg2:string):Promise<main.WarpAccount>;
 
 export function RunWarpScoutFullEngine(arg1:number):Promise<Array<main.EndpointResult>>;
+
+export function SetSystemProxy(arg1:boolean):Promise<string>;

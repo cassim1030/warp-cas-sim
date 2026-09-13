@@ -226,7 +226,7 @@
         <input type="text" id="subUrl" class="sub-input" readonly value="http://127.0.0.1:8888/sub">
         <label class="field" style="margin-top: 10px;">V2rayN 专用订阅 (V2rayN「订阅分组→订阅」粘贴此链接):</label>
         <input type="text" id="v2raynUrl" class="sub-input" readonly value="http://127.0.0.1:8888/v2rayn">
-        <label class="field" style="margin-top: 6px; font-size: 11px; color: #94a3b8;">※ 官方 SFW GUI 用法: 把 sub.txt 第一行填本订阅链接, 或下载 JSON 放 SFW 目录改名 config.json → SFW.bat 启动。※ 浏览器上网需手动设系统代理 127.0.0.1:2080 (SFW 无 TUN)。</label>
+        <label class="field" style="margin-top: 6px; font-size: 11px; color: #94a3b8;">※ SFW 官方 GUI: 概述页打开「系统 HTTP 代理」开关即可自动接管浏览器 (无需手动填 2080); 没有开关时到 Windows 设置→代理→127.0.0.1:2080。※ 手机 (SFA/SFI/Karing): 直接订阅本链接, 自动下发 TUN 版配置全局接管, 无需任何手动设置。</label>
       </div>
       <div class="section">
         <div class="section-title">二次定型客户端配置 (B 配置)</div>
@@ -329,6 +329,16 @@
 
     window.addEventListener("DOMContentLoaded", () => {
       appendLog('[准备就绪] 点击「一键全自动」开始执行');
+      // 系统代理按钮状态初始化 (若代理已开, 按钮显示"已开启")
+      if (window.go && window.go.main && window.go.main.App) {
+        window.go.main.App.IsSystemProxyOn().then(on => {
+          const btn = document.getElementById('sysProxyBtn');
+          if (on && btn) {
+            btn.textContent = "🖥️ 系统代理已开启 (127.0.0.1:2080) — 点击关闭";
+            btn.style.background = "linear-gradient(135deg, #16a34a, #15803d)";
+          }
+        }).catch(() => {});
+      }
       if (window.runtime && window.runtime.EventsOn) {
         window.runtime.EventsOn("log", function(msg) { appendLog(msg); });
         window.runtime.EventsOn("scan_progress", function(data) {
